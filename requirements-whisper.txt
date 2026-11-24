@@ -1,0 +1,8 @@
+# The Whisper pipeline venv (D:\whisper\venv, Python 3.11) as tested on an Intel Arc B580.
+# PyTorch for Intel GPUs (XPU) comes from Intel's/PyTorch's XPU wheel index, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/xpu
+# NVIDIA users: install the regular CUDA build of torch instead; transcribe.py falls back to CPU otherwise.
+torch==2.15.0+xpu
+openai-whisper==20250625
+faster-whisper==1.2.1
+numpy==2.4.6

@@ -1,0 +1,13 @@
+{
+  "next_start_index": 218,
+  "batch_size": 14,
+  "drive_folder_name": "EDITOR | SEM",
+  "drive_email": "your-drive-account@gmail.com",
+  "youtube_email": "your-youtube-account@gmail.com",
+  "timezone": "Asia/Manila",
+  "daily_slots_pht": [
+    "21:00:00",
+    "21:30:00"
+  ],
+  "completed_outputs": {}
+}

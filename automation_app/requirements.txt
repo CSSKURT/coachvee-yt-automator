@@ -1,0 +1,12 @@
+# Coach Vee Automator - the app's OWN venv (automation_app\.venv).
+# The Whisper venv (D:\whisper\venv) is never modified; the app only calls its python.exe.
+customtkinter>=5.2
+google-api-python-client>=2.100
+google-auth>=2.30
+google-auth-oauthlib>=1.2
+google-auth-httplib2>=0.2
+google-genai>=1.0
+tzdata
+pillow>=10
+# optional: only used by the "YouTube Studio Browser Automation" fallback (uses your installed Chrome)
+playwright>=1.45

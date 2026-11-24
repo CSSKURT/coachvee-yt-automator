@@ -1,0 +1,25 @@
+{
+  "whisper_python": "D:\\whisper\\venv\\Scripts\\python.exe",
+  "whisper_dir": "D:\\whisper",
+  "ffmpeg_path": "D:\\ytdl\\ffmpeg.exe",
+  "whisper_model": "large-v3",
+  "whisper_language": "tl",
+  "srt_max_chars": 30,
+  "cpu_fallback_after_gpu_failures": true,
+  "staging_dir": "D:\\bot\\jobs",
+  "client_secret_path": "D:/whisper/automation_app/tokens/client_secret.json",
+  "ai_provider": "gemini",
+  "gemini_api_key": "",
+  "gemini_model": "gemini-3.5-flash",
+  "gemini_fallback_models": [
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite"
+  ],
+  "claude_cli_path": "",
+  "claude_model": "sonnet",
+  "ai_batch_phrases": 350,
+  "upload_method": "api",
+  "youtube_category_id": "22",
+  "playwright_browser_channel": "chrome",
+  "playwright_headless": false
+}

@@ -1,0 +1,32 @@
+# Allow-list: D:\whisper also holds the Whisper venv, models, test audio and private data.
+# Only the files below are ever committed.
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/docs/
+!/transcribe.py
+!/make_phrases.py
+!/merge_edits.py
+!/build_srt.py
+!/WHISPER_PIPELINE_HANDOFF.md
+!/requirements-whisper.txt
+!/automation_app/
+
+# ---- private / machine-specific (never commit) ----
+/automation_app/.venv/
+/automation_app/tokens/
+/automation_app/logs/
+/automation_app/metadata/
+/automation_app/ai_work/
+/automation_app/browser_profile/
+/automation_app/config.json
+/automation_app/state.json
+/automation_app/*.lock
+/automation_app/*.tmp
+/automation_app/SETUP_GUIDE.md
+/automation_app/COACH_VEE_GUIDE.html
+__pycache__/
+*.pyc
+*.prev.json
+*.bak*
