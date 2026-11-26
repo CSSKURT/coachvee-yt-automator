@@ -209,30 +209,44 @@ def _metadata(n: int) -> tuple[str, str]:
     return enforce_title(meta["title"]), clean_description(meta["description"])
 
 
-def _verify_after_unclear_end(n: int, item: dict, title: str, err, cfg: dict) -> dict | None:
-    """The browser closed / timed out AFTER the file was uploaded. Look the video up in Studio:
-    Scheduled (or Private when no slot) = success; Draft = record as draft (GO schedules it in place);
-    not found = None (real failure). Never uploads again."""
-    from youtube_playwright_fallback import verify_in_studio
-    log.warning(f"  Output {n}: unclear ending ({err}) - checking YouTube Studio ...")
+RETRY_UPLOAD = "retry"      # _studio_recover(): nothing usable is left in Studio -> safe to upload again
+
+
+def _studio_recover(n: int, item: dict, title: str, err, cfg: dict, passes: int = 3):
+    """Something went wrong after the file was chosen (Chrome closed, upload cancelled / failed, timeout).
+    Ask Studio what is really there, then:
+      Scheduled (or Private when no slot) -> success dict (no new upload)
+      Draft                               -> recorded as draft, raises (GO schedules that draft in place)
+      Upload interrupted / cancelled      -> that broken row is deleted, returns RETRY_UPLOAD
+      not listed at all                   -> RETRY_UPLOAD, unless Schedule was already pressed (then raise:
+                                             better to check by hand than to make a duplicate)"""
+    from youtube_playwright_fallback import delete_interrupted_uploads, verify_in_studio
+    if err is not None:
+        log.warning(f"  Output {n}: unclear ending ({err}) - checking YouTube Studio ...")
     try:
-        row = verify_in_studio(cfg, title, getattr(err, "video_id", None), log.info)
+        row = verify_in_studio(cfg, title, getattr(err, "video_id", None), log.info, passes=passes)
     except Exception as e:
-        log.warning(f"  Output {n}: could not check Studio ({e})")
-        row = None
-    if not row:
-        log.warning(f"  Output {n}: not found in Studio - recorded as failed")
-        return None
-    ok_status = "Scheduled" if item["_schedule"] else "Private"
-    log.info(f"  Output {n}: found in Studio as {row['status']} {row['date']} ({row['video_id']})")
-    if row["status"] == ok_status or row["status"] == "Scheduled":
-        return {"video_id": row["video_id"], "url": f"https://youtu.be/{row['video_id']}",
-                "captions_done": True, "verified": True}
-    if row["status"] == "Draft" and row["video_id"]:
-        _record(n, status="draft", method="playwright", video_id=row["video_id"], publish_at=item["publish_at"],
-                title=title, error=None, note="Found as a draft after the browser closed; GO schedules it")
-        raise RuntimeError(f"left as a DRAFT in Studio ({row['video_id']}) - click GO to schedule it")
-    return None
+        raise RuntimeError(f"could not check YouTube Studio ({e}) - check Output {n} there by hand") from None
+    if row:
+        log.info(f"  Output {n}: found in Studio as {row['status'] or '?'} {row['date']} ({row['video_id'] or 'no id'})")
+        ok_status = "Scheduled" if item["_schedule"] else "Private"
+        if row["status"] in (ok_status, "Scheduled") and row["video_id"]:
+            return {"video_id": row["video_id"], "url": f"https://youtu.be/{row['video_id']}",
+                    "captions_done": True, "verified": True}
+        if row["status"] == "Draft" and row["video_id"]:
+            _record(n, status="draft", method="playwright", video_id=row["video_id"], publish_at=item["publish_at"],
+                    title=title, error=None, note="Found as a draft in Studio; GO schedules it")
+            raise RuntimeError(f"left as a DRAFT in Studio ({row['video_id']}) - click GO to schedule it")
+        if row["status"] == "Interrupted":
+            gone = delete_interrupted_uploads(cfg, title, log.info)
+            log.warning(f"  Output {n}: upload never finished in Studio - removed {gone} broken copy(ies)")
+            return RETRY_UPLOAD
+        raise RuntimeError(f"Studio shows it as '{row['status'] or 'unknown'}' - check Output {n} there by hand")
+    if err is not None and getattr(err, "done_clicked", False) and not getattr(err, "interrupted", False):
+        raise RuntimeError("Schedule was pressed but Studio doesn't list the video yet - check Studio by hand "
+                           "before clicking GO again (avoids a duplicate)")
+    log.warning(f"  Output {n}: not in Studio (upload was cancelled or never started)")
+    return RETRY_UPLOAD
 
 
 def process_item(item: dict, cfg: dict, state: dict, method: str, yt_holder: dict):
@@ -264,21 +278,37 @@ def process_item(item: dict, cfg: dict, state: dict, method: str, yt_holder: dic
 
     if method == "playwright":
         from youtube_playwright_fallback import StudioError, upload_via_studio
+        res = None
+        if rec.get("status") == "failed":
+            # an earlier run failed: it may in fact be scheduled, or a broken half-upload may be sitting in
+            # Studio. Check first so GO never makes a duplicate and always cleans up the broken copy.
+            _set_uploader(message=f"Studio browser: checking earlier attempt of Output {n}")
+            log.info(f"  Output {n}: failed before - checking YouTube Studio first")
+            got = _studio_recover(n, item, title, None, cfg, passes=1)
+            if got != RETRY_UPLOAD:
+                res = got
         _set_uploader(message=f"Studio browser: uploading Output {n}")
-        for attempt in (1, 2):
+        for attempt in (1, 2) if res is None else ():
             try:
                 res = upload_via_studio(item["video_path"], item["srt_path"], title, desc,
                                         item["_publish_dt"] if item["_schedule"] else None, cfg, log.info)
                 break
             except StudioError as e:
-                if attempt == 1 and e.before_upload:      # nothing was created on YouTube yet
-                    log.warning(f"  Output {n}: Studio didn't open the uploader ({e}) - retrying once")
+                if e.before_upload:                       # nothing was created on YouTube yet
+                    if attempt == 1:
+                        log.warning(f"  Output {n}: Studio didn't open the uploader ({e}) - retrying once")
+                        _sleep_checked(10)
+                        continue
+                    raise
+                # the upload started: ask Studio what happened (scheduled? draft? half-uploaded?)
+                got = _studio_recover(n, item, title, e, cfg)
+                if got != RETRY_UPLOAD:
+                    res = got
+                    break
+                if attempt == 1:
+                    log.warning(f"  Output {n}: uploading again (attempt 2 of 2)")
                     _sleep_checked(10)
                     continue
-                if not e.before_upload:                   # the video exists on YouTube: ask Studio what happened
-                    res = _verify_after_unclear_end(n, item, title, e, cfg)
-                    if res:
-                        break
                 raise
         captions = res.get("captions_done", False) or not has_srt
         if not captions and res.get("video_id"):

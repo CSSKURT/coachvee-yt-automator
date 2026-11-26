@@ -41,12 +41,15 @@ SEL = {
     "date_input": "ytcp-date-picker tp-yt-paper-input input, #textbox input[aria-label*='date' i]",
     "time_input": "#time-of-day-container input, ytcp-form-input-container#time-of-day-trigger input",
     "close_after": "ytcp-uploads-still-processing-dialog #close-button, #close-button",
+    "del_checkbox": "ytcp-confirmation-dialog #confirm-checkbox",
+    "del_confirm": "ytcp-confirmation-dialog #confirm-button",
 }
 
 
 class StudioError(Exception):
-    def __init__(self, msg, before_upload=False, done_clicked=False, video_id=None):
+    def __init__(self, msg, before_upload=False, done_clicked=False, video_id=None, interrupted=False):
         super().__init__(msg)
+        self.interrupted = interrupted          # True = the file upload itself was cancelled / failed / cut off
         self.before_upload = before_upload      # True = no video was created yet, safe to retry
         self.done_clicked = done_clicked        # True = Schedule/Save was pressed: check Studio before calling it failed
         self.video_id = video_id
@@ -109,7 +112,7 @@ def _type_multiline(page, locator, text: str):
 
 def _click_next(page, times=1):
     for _ in range(times):
-        page.locator(SEL["next"]).first.click()
+        page.locator(SEL["next"]).filter(visible=True).first.click()
         page.wait_for_timeout(1500)
 
 
@@ -125,6 +128,8 @@ def _wait_upload_finished(page, log, timeout_min=60):
         if txt and txt != last:
             log(f"    Studio: {txt}")
             last = txt
+        if txt and re.search(r"cancel+ed|upload failed|upload error|network error|abandoned|interrupted", txt, re.I):
+            raise StudioError(f"upload stopped in Studio ({txt[:120]})", interrupted=True)
         if txt and not re.search(r"upload(ing)?\s*\d+\s*%|uploading", txt, re.I):
             return
         page.wait_for_timeout(3000)
@@ -203,9 +208,11 @@ def _finish_and_confirm(page, log, timeout_s: int = 120, state: dict | None = No
     - 'Got it' is clicked instantly via JS, only when that button is really on screen.
     - Schedule is never pressed twice.
     """
-    page.locator(SEL["done"]).first.click()
     if state is not None:
-        state["done_clicked"] = True
+        state["done_clicked"] = True           # set BEFORE the click: a click that times out may still have landed
+    # only the VISIBLE Schedule button: when Studio opens a second (hidden) upload dialog, .first
+    # used to be the hidden one and the click timed out after 30 s (2026-11-26, Output 267)
+    page.locator(SEL["done"]).filter(visible=True).first.click()
     end = time.time() + timeout_s
     while time.time() < end:
         dialogs = page.evaluate(_VISIBLE_DIALOG_TEXT_JS) or ""
@@ -223,37 +230,72 @@ def _finish_and_confirm(page, log, timeout_s: int = 120, state: dict | None = No
     raise StudioError("Studio never confirmed the schedule (video may still be a draft)", done_clicked=True)
 
 
-def list_studio_shorts(cfg: dict, max_rows: int = 40, log=print) -> list:
-    """Read-only: [{video_id, title, status, date}] from Content -> Shorts (newest first)."""
+# A row whose upload never finished: the Chrome window was closed mid-upload, the upload was
+# cancelled, or it errored. Studio shows "Upload interrupted / Resume upload / Cancel upload".
+INTERRUPTED_RE = re.compile(r"Upload interrupted|Upload cancel+ed|Upload failed|Resume upload|Cancel upload|"
+                            r"Uploading \d+\s*%|Processing abandoned", re.I)
+CONTENT_TABS = ("short", "upload")     # Content -> Shorts, then Content -> Videos (a brand-new upload sits
+                                       # under Videos until Studio has processed it into a Short)
+
+
+def _open_content(page, tab: str):
+    if "/channel/UC" not in page.url:
+        page.goto(STUDIO, wait_until="domcontentloaded")
+        page.wait_for_timeout(4000)
+        if "accounts.google.com" in page.url:
+            raise StudioError("Not signed in to YouTube Studio - click 'Studio Login Setup' in the app.")
+        if not re.search(r"/channel/UC", page.url):
+            page.wait_for_url(re.compile(r"/channel/UC"), timeout=30000)
+    cid = re.search(r"/channel/(UC[\w-]+)", page.url).group(1)
+    page.goto(f"{STUDIO}/channel/{cid}/videos/{tab}", wait_until="domcontentloaded")
+    page.wait_for_timeout(5000)
+
+
+def _read_row(r) -> dict:
+    html, text = r.inner_html(), r.inner_text()
+    ids = re.findall(r"/vi(?:_webp)?/([\w-]{11})/|/video/([\w-]{11})/", html)
+    vid = next((a or b for a, b in ids), None)
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if INTERRUPTED_RE.search(text) or 'aria-label="Resume upload"' in html or 'aria-label="Cancel upload"' in html:
+        status = "Interrupted"
+    else:
+        status = next((l for l in lines if l in ("Scheduled", "Draft", "Private", "Public", "Unlisted")), "")
+    date = next((l for l in lines if re.fullmatch(r"[A-Z][a-z]{2} \d{1,2}, \d{4}", l)), "")
+    title = next((l for l in lines if not re.fullmatch(r"\d+:\d{2}", l)), "")
+    return {"video_id": vid, "title": title, "status": status, "date": date}
+
+
+def _title_key(title: str) -> str:
+    return re.sub(r"\s+", " ", title).strip()[:30]
+
+
+def _scan_rows(page, max_rows: int):
+    rows = page.locator("ytcp-video-row")
+    for k in range(min(rows.count(), max_rows)):
+        r = rows.nth(k)
+        try:
+            r.scroll_into_view_if_needed(timeout=5000)
+            page.wait_for_timeout(200)
+        except Exception:
+            pass
+        yield r, _read_row(r)
+
+
+def list_studio_shorts(cfg: dict, max_rows: int = 40, log=print, tabs=CONTENT_TABS) -> list:
+    """Read-only: [{video_id, title, status, date, tab}] from Content -> Shorts and -> Videos (newest first)."""
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         ctx = _launch(p, cfg)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         try:
-            page.goto(STUDIO, wait_until="domcontentloaded")
-            page.wait_for_timeout(4000)
-            m = re.search(r"/channel/(UC[\w-]+)", page.url)
-            if not m:
-                page.wait_for_url(re.compile(r"/channel/UC"), timeout=30000)
-                m = re.search(r"/channel/(UC[\w-]+)", page.url)
-            page.goto(f"{STUDIO}/channel/{m.group(1)}/videos/short", wait_until="domcontentloaded")
-            page.wait_for_timeout(5000)
-            rows, out = page.locator("ytcp-video-row"), []
-            for k in range(min(rows.count(), max_rows)):
-                r = rows.nth(k)
-                try:
-                    r.scroll_into_view_if_needed(timeout=5000)
-                    page.wait_for_timeout(200)
-                except Exception:
-                    pass
-                html, text = r.inner_html(), r.inner_text()
-                ids = re.findall(r"/vi(?:_webp)?/([\w-]{11})/|/video/([\w-]{11})/", html)
-                vid = next((a or b for a, b in ids), None)
-                lines = [l.strip() for l in text.split("\n") if l.strip()]
-                status = next((l for l in lines if l in ("Scheduled", "Draft", "Private", "Public", "Unlisted")), "")
-                date = next((l for l in lines if re.fullmatch(r"[A-Z][a-z]{2} \d{1,2}, \d{4}", l)), "")
-                title = next((l for l in lines if not re.fullmatch(r"\d+:\d{2}", l)), "")
-                out.append({"video_id": vid, "title": title, "status": status, "date": date})
+            out, seen = [], set()
+            for tab in tabs:
+                _open_content(page, tab)
+                for _, row in _scan_rows(page, max_rows):
+                    k = row["video_id"] or (row["title"], row["status"])
+                    if k not in seen:
+                        seen.add(k)
+                        out.append(dict(row, tab=tab))
             return out
         finally:
             try:
@@ -262,13 +304,60 @@ def list_studio_shorts(cfg: dict, max_rows: int = 40, log=print) -> list:
                 pass
 
 
-def verify_in_studio(cfg: dict, title: str, video_id, log=print):
-    """After an unclear ending (browser closed, timeout): look the video up in Studio by id or title."""
-    key = re.sub(r"\s+", " ", title).strip()[:30]
-    for row in list_studio_shorts(cfg, log=log):
-        if (video_id and row["video_id"] == video_id) or (key and row["title"].startswith(key)):
-            return row
+def verify_in_studio(cfg: dict, title: str, video_id, log=print, passes: int = 3, wait_s: int = 20):
+    """After an unclear ending (browser closed, timeout): look the video up in Studio by id or title.
+    Checks Shorts AND Videos, and looks again (up to `passes` times) because a just-saved upload can take
+    a little while to show up. A finished video wins over an interrupted copy with the same title."""
+    key = _title_key(title)
+    for i in range(passes):
+        hits = [r for r in list_studio_shorts(cfg, log=log)
+                if (video_id and r["video_id"] == video_id) or (key and r["title"].startswith(key))]
+        done = [r for r in hits if r["status"] in ("Scheduled", "Private", "Public", "Unlisted", "Draft")]
+        if done or hits:
+            return (done or hits)[0]
+        if i < passes - 1:
+            log(f"    Studio: '{key}' not listed yet - looking again in {wait_s}s")
+            time.sleep(wait_s)
     return None
+
+
+def delete_interrupted_uploads(cfg: dict, title: str, log=print) -> int:
+    """Permanently delete ONLY this title's rows whose upload never finished ('Upload interrupted' /
+    still 'Uploading' after our browser was closed / cancelled). Scheduled, draft or published videos are
+    never touched. Returns how many rows were deleted."""
+    from playwright.sync_api import sync_playwright
+    key, deleted = _title_key(title), 0
+    with sync_playwright() as p:
+        ctx = _launch(p, cfg)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.set_default_timeout(20000)
+        try:
+            for tab in CONTENT_TABS:
+                for _ in range(5):                           # list re-renders after each delete: rescan
+                    _open_content(page, tab)
+                    target = next((r for r, row in _scan_rows(page, 40)
+                                   if row["status"] == "Interrupted" and row["title"].startswith(key)), None)
+                    if target is None:
+                        break
+                    target.hover()
+                    page.wait_for_timeout(500)
+                    target.locator("[aria-label='Delete video']").first.click()
+                    page.locator(SEL["del_checkbox"]).filter(visible=True).first.click()
+                    page.wait_for_timeout(500)
+                    page.locator(SEL["del_confirm"]).filter(visible=True).first.click()
+                    page.wait_for_timeout(4000)
+                    deleted += 1
+                    log(f"    Studio: deleted interrupted upload '{key}' ({tab} tab)")
+            return deleted
+        except Exception as e:
+            shot = _shot(page, "delete_error")
+            raise StudioError(f"could not delete the interrupted upload: {str(e).splitlines()[0][:200]} "
+                              f"(screenshot: {shot})")
+        finally:
+            try:
+                ctx.close()
+            except Exception:
+                pass
 
 
 def schedule_existing_draft(video_id: str, publish_at: datetime, cfg: dict, log=print) -> dict:
@@ -401,9 +490,10 @@ def upload_via_studio(video: str, srt: str, title: str, description: str, publis
         except Exception as e:
             closed = "has been closed" in str(e)
             shot = "" if closed else f" (screenshot: {_shot(page, 'error')})"
+            done = flow.get("done_clicked", False)
             raise StudioError(("Chrome window was closed" if closed else str(e).splitlines()[0][:300]) + shot,
-                              before_upload=not selected, done_clicked=flow.get("done_clicked", False),
-                              video_id=video_id)
+                              before_upload=not selected, done_clicked=done, video_id=video_id,
+                              interrupted=getattr(e, "interrupted", False) or (closed and not done))
         finally:
             try:
                 ctx.close()
