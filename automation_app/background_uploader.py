@@ -209,6 +209,32 @@ def _metadata(n: int) -> tuple[str, str]:
     return enforce_title(meta["title"]), clean_description(meta["description"])
 
 
+def _verify_after_unclear_end(n: int, item: dict, title: str, err, cfg: dict) -> dict | None:
+    """The browser closed / timed out AFTER the file was uploaded. Look the video up in Studio:
+    Scheduled (or Private when no slot) = success; Draft = record as draft (GO schedules it in place);
+    not found = None (real failure). Never uploads again."""
+    from youtube_playwright_fallback import verify_in_studio
+    log.warning(f"  Output {n}: unclear ending ({err}) - checking YouTube Studio ...")
+    try:
+        row = verify_in_studio(cfg, title, getattr(err, "video_id", None), log.info)
+    except Exception as e:
+        log.warning(f"  Output {n}: could not check Studio ({e})")
+        row = None
+    if not row:
+        log.warning(f"  Output {n}: not found in Studio - recorded as failed")
+        return None
+    ok_status = "Scheduled" if item["_schedule"] else "Private"
+    log.info(f"  Output {n}: found in Studio as {row['status']} {row['date']} ({row['video_id']})")
+    if row["status"] == ok_status or row["status"] == "Scheduled":
+        return {"video_id": row["video_id"], "url": f"https://youtu.be/{row['video_id']}",
+                "captions_done": True, "verified": True}
+    if row["status"] == "Draft" and row["video_id"]:
+        _record(n, status="draft", method="playwright", video_id=row["video_id"], publish_at=item["publish_at"],
+                title=title, error=None, note="Found as a draft after the browser closed; GO schedules it")
+        raise RuntimeError(f"left as a DRAFT in Studio ({row['video_id']}) - click GO to schedule it")
+    return None
+
+
 def process_item(item: dict, cfg: dict, state: dict, method: str, yt_holder: dict):
     n = item["output"]
     rec = state["completed_outputs"].get(str(n)) or {}
@@ -249,6 +275,10 @@ def process_item(item: dict, cfg: dict, state: dict, method: str, yt_holder: dic
                     log.warning(f"  Output {n}: Studio didn't open the uploader ({e}) - retrying once")
                     _sleep_checked(10)
                     continue
+                if not e.before_upload:                   # the video exists on YouTube: ask Studio what happened
+                    res = _verify_after_unclear_end(n, item, title, e, cfg)
+                    if res:
+                        break
                 raise
         captions = res.get("captions_done", False) or not has_srt
         if not captions and res.get("video_id"):
@@ -330,7 +360,8 @@ def main() -> int:
                 return 2
             except Exception as e:
                 log.error(f"  Output {n}: FAILED - {e}\n{traceback.format_exc()}")
-                _record(n, status="failed", error=str(e)[:500])
+                cur = (load_state()["completed_outputs"].get(str(n)) or {}).get("status")
+                _record(n, status="draft" if cur == "draft" else "failed", error=str(e)[:500])
                 failed.append(n)
                 i += 1
 

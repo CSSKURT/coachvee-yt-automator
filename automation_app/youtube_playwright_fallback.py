@@ -45,9 +45,11 @@ SEL = {
 
 
 class StudioError(Exception):
-    def __init__(self, msg, before_upload=False):
+    def __init__(self, msg, before_upload=False, done_clicked=False, video_id=None):
         super().__init__(msg)
         self.before_upload = before_upload      # True = no video was created yet, safe to retry
+        self.done_clicked = done_clicked        # True = Schedule/Save was pressed: check Studio before calling it failed
+        self.video_id = video_id
 
 
 def _launch(p, cfg, headless=None):
@@ -154,7 +156,8 @@ def _try_subtitles(page, srt_path: str, log) -> bool:
         return False
 
 
-CONFIRM_RE = re.compile(r"Video (scheduled|published|saved)|will be set to (public|private|unlisted) on", re.I)
+CONFIRM_RE = re.compile(r"Video (scheduled|published|saved|uploaded)|will be set to (public|private|unlisted) on|"
+                        r"(saved|set) as private|Video processing", re.I)
 
 
 def _set_schedule(page, publish_at: datetime, log):
@@ -181,37 +184,91 @@ def _set_schedule(page, publish_at: datetime, log):
     log(f"    Studio: schedule set to {publish_at:%b %d %Y} {shown_time or publish_at.strftime('%I:%M %p')} (Asia/Manila)")
 
 
-def _finish_and_confirm(page, log, timeout_s: int = 90):
-    """Click Schedule/Save and WAIT for Studio's 'Video scheduled' confirmation.
-    Closing the browser before this appears leaves the video as a draft (the 2026-11-10 bug)."""
+_VISIBLE_DIALOG_TEXT_JS = r"""() => [...document.querySelectorAll(
+    'tp-yt-paper-dialog, ytcp-dialog, ytcp-uploads-still-processing-dialog, ytcp-video-share-dialog, [role=dialog]')]
+    .filter(d => d.offsetParent !== null && getComputedStyle(d).visibility !== 'hidden')
+    .map(d => d.innerText || '').join('\n---\n')"""
+
+_CLICK_VISIBLE_GOT_IT_JS = r"""() => {
+    const b = [...document.querySelectorAll('button, ytcp-button, tp-yt-paper-button')]
+      .find(x => x.offsetParent !== null && /^\s*Got it\s*$/i.test(x.innerText || ''));
+    if (b) { b.click(); return true; } return false; }"""
+
+
+def _finish_and_confirm(page, log, timeout_s: int = 120, state: dict | None = None):
+    """Press Schedule/Save ONCE, then poll (every 0.5 s) the VISIBLE dialogs for Studio's confirmation.
+
+    - Only visible dialogs count: the hidden 'still checking your content' text stays in the page
+      after 'Got it' and used to make this loop spin for 30-70 s (2026-11-24 bug).
+    - 'Got it' is clicked instantly via JS, only when that button is really on screen.
+    - Schedule is never pressed twice.
+    """
     page.locator(SEL["done"]).first.click()
+    if state is not None:
+        state["done_clicked"] = True
     end = time.time() + timeout_s
-    acknowledged = 0
     while time.time() < end:
-        body = page.evaluate("() => document.body.innerText") or ""
-        # "We're still checking your content ... Got it": an info pop-up. Acknowledge, scheduling continues.
-        if re.search(r"still checking your content", body, re.I) and acknowledged < 3:
-            try:
-                page.get_by_role("button", name=re.compile(r"^\s*Got it\s*$", re.I)).last.click(timeout=4000)
-                acknowledged += 1
-                log("    Studio: 'still checking your content' notice - clicked Got it")
-                page.wait_for_timeout(1500)
-                body = page.evaluate("() => document.body.innerText") or ""
-                if not CONFIRM_RE.search(body) and page.locator(SEL["done"]).first.is_enabled():
-                    page.locator(SEL["done"]).first.click()      # press Schedule again if the pop-up ate it
-            except Exception:
-                pass
-        m = CONFIRM_RE.search(body)
+        dialogs = page.evaluate(_VISIBLE_DIALOG_TEXT_JS) or ""
+        m = CONFIRM_RE.search(dialogs)
         if m:
             log(f"    Studio: confirmed - '{m.group(0)}'")
-            page.wait_for_timeout(1500)
             try:
-                page.locator(SEL["close_after"]).first.click(timeout=5000)
+                page.locator(SEL["close_after"]).first.click(timeout=2000)
             except Exception:
                 pass
             return
-        page.wait_for_timeout(1000)
-    raise StudioError("Studio never confirmed the schedule (video may still be a draft)")
+        if re.search(r"still checking your content", dialogs, re.I) and page.evaluate(_CLICK_VISIBLE_GOT_IT_JS):
+            log("    Studio: 'still checking your content' notice - clicked Got it")
+        page.wait_for_timeout(500)
+    raise StudioError("Studio never confirmed the schedule (video may still be a draft)", done_clicked=True)
+
+
+def list_studio_shorts(cfg: dict, max_rows: int = 40, log=print) -> list:
+    """Read-only: [{video_id, title, status, date}] from Content -> Shorts (newest first)."""
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        ctx = _launch(p, cfg)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        try:
+            page.goto(STUDIO, wait_until="domcontentloaded")
+            page.wait_for_timeout(4000)
+            m = re.search(r"/channel/(UC[\w-]+)", page.url)
+            if not m:
+                page.wait_for_url(re.compile(r"/channel/UC"), timeout=30000)
+                m = re.search(r"/channel/(UC[\w-]+)", page.url)
+            page.goto(f"{STUDIO}/channel/{m.group(1)}/videos/short", wait_until="domcontentloaded")
+            page.wait_for_timeout(5000)
+            rows, out = page.locator("ytcp-video-row"), []
+            for k in range(min(rows.count(), max_rows)):
+                r = rows.nth(k)
+                try:
+                    r.scroll_into_view_if_needed(timeout=5000)
+                    page.wait_for_timeout(200)
+                except Exception:
+                    pass
+                html, text = r.inner_html(), r.inner_text()
+                ids = re.findall(r"/vi(?:_webp)?/([\w-]{11})/|/video/([\w-]{11})/", html)
+                vid = next((a or b for a, b in ids), None)
+                lines = [l.strip() for l in text.split("\n") if l.strip()]
+                status = next((l for l in lines if l in ("Scheduled", "Draft", "Private", "Public", "Unlisted")), "")
+                date = next((l for l in lines if re.fullmatch(r"[A-Z][a-z]{2} \d{1,2}, \d{4}", l)), "")
+                title = next((l for l in lines if not re.fullmatch(r"\d+:\d{2}", l)), "")
+                out.append({"video_id": vid, "title": title, "status": status, "date": date})
+            return out
+        finally:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+
+def verify_in_studio(cfg: dict, title: str, video_id, log=print):
+    """After an unclear ending (browser closed, timeout): look the video up in Studio by id or title."""
+    key = re.sub(r"\s+", " ", title).strip()[:30]
+    for row in list_studio_shorts(cfg, log=log):
+        if (video_id and row["video_id"] == video_id) or (key and row["title"].startswith(key)):
+            return row
+    return None
 
 
 def schedule_existing_draft(video_id: str, publish_at: datetime, cfg: dict, log=print) -> dict:
@@ -285,6 +342,8 @@ def upload_via_studio(video: str, srt: str, title: str, description: str, publis
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.set_default_timeout(30000)
         selected = False
+        flow: dict = {}
+        video_id = None
         try:
             page.goto(STUDIO, wait_until="domcontentloaded")
             page.wait_for_timeout(4000)
@@ -337,11 +396,14 @@ def upload_via_studio(video: str, srt: str, title: str, description: str, publis
                 page.get_by_text(re.compile(r"^\s*Private\s*$")).first.click()
 
             _wait_upload_finished(page, log)
-            _finish_and_confirm(page, log)
+            _finish_and_confirm(page, log, state=flow)
             return {"video_id": video_id, "url": url, "captions_done": captions}
         except Exception as e:
-            shot = _shot(page, "error")
-            raise StudioError(f"{str(e).splitlines()[0][:300]} (screenshot: {shot})", before_upload=not selected)
+            closed = "has been closed" in str(e)
+            shot = "" if closed else f" (screenshot: {_shot(page, 'error')})"
+            raise StudioError(("Chrome window was closed" if closed else str(e).splitlines()[0][:300]) + shot,
+                              before_upload=not selected, done_clicked=flow.get("done_clicked", False),
+                              video_id=video_id)
         finally:
             try:
                 ctx.close()
